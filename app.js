@@ -74,24 +74,29 @@ function stopWatcher(port, protocol) {
     delete killDB[ePort(port, protocol, 'socat')];
     console.log(`Stopped socat watcher for ${port} with pid ${pid}`);
 }
-
 function iptablesAddForward(protocol, fromPort, toIp, toPort) {
     try {
+        // External clients → PREROUTING
         execSync(`iptables -t nat -A PREROUTING -p ${protocol} -d ${SERVER_PUBLIC_IP} --dport ${fromPort} -j DNAT --to-destination ${toIp}:${toPort}`);
+        // Local-origin traffic → OUTPUT
+        execSync(`iptables -t nat -A OUTPUT -p ${protocol} -d ${SERVER_PUBLIC_IP} --dport ${fromPort} -j DNAT --to-destination ${toIp}:${toPort}`);
         console.log(`Added iptables forward ${protocol} ${fromPort} => ${toIp}:${toPort}`);
     } catch (e) {
         console.error(e.stdout?.toString() || e.message);
         throw new Error("iptables add failed");
     }
 }
+
 function iptablesRemoveForward(protocol, fromPort, toIp, toPort) {
     try {
         execSync(`iptables -t nat -D PREROUTING -p ${protocol} -d ${SERVER_PUBLIC_IP} --dport ${fromPort} -j DNAT --to-destination ${toIp}:${toPort}`);
+        execSync(`iptables -t nat -D OUTPUT -p ${protocol} -d ${SERVER_PUBLIC_IP} --dport ${fromPort} -j DNAT --to-destination ${toIp}:${toPort}`);
         console.log(`Removed iptables forward ${protocol} ${fromPort} => ${toIp}:${toPort}`);
     } catch (e) {
         console.error(e.stdout?.toString() || e.message);
     }
 }
+
 
 function syncPortDB() {
     if (!fs.existsSync('./ports.json')) {
