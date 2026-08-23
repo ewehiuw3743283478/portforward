@@ -1,16 +1,25 @@
 {
   "name": "portbot",
-  "version": "1.0.0",
-  "description": "Simple web-based port forward manager with socat and iptables support.",
+  "version": "1.1.0",
+  "description": "Web-based port forward manager with socat/iptables, session login, and TOTP.",
   "main": "app.js",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
-    "start": "node app.js"
+    "start": "node app.js",
+    "install-service": "bash scripts/install-service.sh",
+    "uninstall-service": "bash scripts/uninstall-service.sh"
   },
   "dependencies": {
-    "body-parser": "^2.2.0",
+    "bcryptjs": "^3.0.3",
+    "dotenv": "^16.4.5",
     "ejs": "^3.1.10",
     "express": "^5.1.0",
-    "express-basic-auth": "^1.2.1",
-    "dotenv": "^16.4.5"
+    "express-rate-limit": "^8.6.2",
+    "express-session": "^1.19.0",
+    "helmet": "^8.3.0",
+    "otpauth": "^9.5.1",
+    "qrcode": "^1.5.4"
   }
 }

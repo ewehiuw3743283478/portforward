@@ -1,0 +1,19 @@
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+    <div class="topbar-left">
+        <%- include('brand') %>
+        <a class="nav-link <%= title === 'Forwards' ? 'is-active' : '' %>" href="/">Forwards</a>
+        <a class="nav-link <%= title === 'Security' ? 'is-active' : '' %>" href="/security">Security</a>
+    </div>
+    <div class="topbar-right">
+        <span class="chip" title="This server's public IP">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span class="mono"><%= publicIp %></span>
+        </span>
+        <span class="chip"><%= currentUser %></span>
+        <form class="inline-form" action="/logout" method="POST">
+            <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+            <button class="btn btn-ghost btn-small" type="submit">Sign out</button>
+        </form>
+    </div>
+</header>

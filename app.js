@@ -1,184 +1,748 @@
-require('dotenv').config();
-const requiredEnv = ['PORT', 'AUTH_USER', 'AUTH_PASS', 'SERVER_PUBLIC_IP'];
-const missing = requiredEnv.filter(key => !process.env[key]);
+'use strict';
 
-if (missing.length > 0) {
-    console.error(`❌ Missing required environment variables: ${missing.join(', ')}`);
-    console.error('Please complete your .env file before starting the application.');
-    process.exit(1); // Exit the app
-}
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const express = require('express');
-const basicAuth = require('express-basic-auth');
+const session = require('express-session');
+const helmet = require('helmet');
+const { rateLimit } = require('express-rate-limit');
 const fs = require('fs');
-const bodyParser = require('body-parser');
-const { spawn, execSync } = require('child_process');
-const path = require('path');
+const crypto = require('crypto');
+const { spawn, execFileSync } = require('child_process');
+
+const auth = require('./lib/auth');
+const firewall = require('./lib/firewall');
+const { listInterfaces, ipv4Of, parseIface } = require('./lib/net');
+const {
+    parseIPv4,
+    parseBindHost,
+    parsePort,
+    parseProtocol,
+    parseMethod,
+    parseUsername,
+    validateNewPassword
+} = require('./lib/validate');
+
+const PORTS_FILE = path.join(__dirname, 'ports.json');
+
+if (!auth.exists()) {
+    const missing = ['PORT', 'AUTH_USER', 'AUTH_PASS', 'SERVER_PUBLIC_IP'].filter((key) => !process.env[key]);
+    if (missing.length) {
+        console.error(`Missing required environment variables: ${missing.join(', ')}`);
+        console.error('Copy .env.example to .env in the app directory, or run: sudo ./scripts/install-service.sh');
+        process.exit(1);
+    }
+    const username = parseUsername(process.env.AUTH_USER);
+    if (!username) {
+        console.error('AUTH_USER must be 3–32 characters: letters, numbers, dot, underscore, or hyphen.');
+        process.exit(1);
+    }
+    if (String(process.env.AUTH_PASS).length < 8) {
+        console.error('AUTH_PASS must be at least 8 characters. It is only used once to create the hashed login.');
+        process.exit(1);
+    }
+} else {
+    const missing = ['PORT', 'SERVER_PUBLIC_IP'].filter((key) => !process.env[key]);
+    if (missing.length) {
+        console.error(`Missing required environment variables: ${missing.join(', ')}`);
+        console.error('Set them in .env next to app.js (the systemd unit uses that file).');
+        process.exit(1);
+    }
+}
+
+const SERVER_PUBLIC_IP = parseIPv4(process.env.SERVER_PUBLIC_IP);
+if (!SERVER_PUBLIC_IP) {
+    console.error('SERVER_PUBLIC_IP must be a valid IPv4 address.');
+    process.exit(1);
+}
+
+const PORT = parsePort(process.env.PORT);
+if (!PORT) {
+    console.error('PORT must be an integer between 1 and 65535.');
+    process.exit(1);
+}
+
+const BIND_HOST = parseBindHost(process.env.BIND_HOST);
+if (!BIND_HOST) {
+    console.error('BIND_HOST must be 0.0.0.0, localhost, or a valid IPv4 address.');
+    process.exit(1);
+}
+
+if (!auth.exists()) {
+    auth.bootstrap({
+        username: parseUsername(process.env.AUTH_USER),
+        password: process.env.AUTH_PASS,
+        sessionSecret: process.env.SESSION_SECRET || crypto.randomBytes(48).toString('hex')
+    });
+    console.log('Created data/auth.json with a hashed password. Sign in, then set a new panel password.');
+}
 
 const app = express();
-const PORT = process.env.PORT || 392;
+const cookieSecure = process.env.COOKIE_SECURE === 'true' || process.env.COOKIE_SECURE === '1';
+if (process.env.TRUST_PROXY === 'true' || process.env.TRUST_PROXY === '1') {
+    app.set('trust proxy', 1);
+}
 
-app.use(basicAuth({
-    users: { [process.env.AUTH_USER]: process.env.AUTH_PASS },
-    challenge: true,
-    realm: "FW Web"
-}));
-
+app.disable('x-powered-by');
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
-app.use(express.static('public'));
-app.use(bodyParser.urlencoded({ extended: false }));
+
+app.use(helmet({
+    contentSecurityPolicy: {
+        useDefaults: false,
+        directives: {
+            defaultSrc: ["'self'"],
+            styleSrc: ["'self'"],
+            scriptSrc: ["'self'"],
+            imgSrc: ["'self'", 'data:'],
+            formAction: ["'self'"],
+            frameAncestors: ["'none'"],
+            objectSrc: ["'none'"],
+            baseUri: ["'self'"],
+            ...(cookieSecure ? { upgradeInsecureRequests: [] } : {})
+        }
+    },
+    strictTransportSecurity: cookieSecure ? { maxAge: 15552000, includeSubDomains: false } : false,
+    referrerPolicy: { policy: 'no-referrer' }
+}));
+
+app.use(session({
+    name: 'pf.sid',
+    secret: process.env.SESSION_SECRET || auth.getSessionSecret(),
+    resave: false,
+    saveUninitialized: false,
+    rolling: true,
+    cookie: {
+        httpOnly: true,
+        sameSite: 'strict',
+        secure: cookieSecure,
+        maxAge: 8 * 60 * 60 * 1000
+    }
+}));
+
+app.use(express.urlencoded({ extended: false, limit: '16kb' }));
+app.use((req, _res, next) => {
+    if (!req.body || typeof req.body !== 'object') req.body = {};
+    next();
+});
+app.use(express.static(path.join(__dirname, 'public'), {
+    index: false,
+    maxAge: '1h'
+}));
+
+app.use((req, res, next) => {
+    res.set('Cache-Control', 'no-store');
+    if (!req.session.csrfToken) {
+        req.session.csrfToken = crypto.randomBytes(32).toString('hex');
+    }
+    const profile = auth.getPublic();
+    res.locals.csrfToken = req.session.csrfToken;
+    res.locals.currentUser = req.session.user || null;
+    res.locals.publicIp = SERVER_PUBLIC_IP;
+    res.locals.appPort = PORT;
+    res.locals.profile = profile;
+    res.locals.flash = pullFlash(req);
+    res.locals.freshBackupCodes = req.session.freshBackupCodes || null;
+    next();
+});
+
+const loginLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 20,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+    validate: { xForwardedForHeader: false },
+    handler: (req, res) => {
+        setFlash(req, 'error', 'Too many sign-in attempts from this address. Try again in 15 minutes.');
+        res.redirect('/login');
+    }
+});
 
 let portDB = {};
-let killDB = {};
+const killDB = {};
 
-const SERVER_PUBLIC_IP = process.env.SERVER_PUBLIC_IP;
+function setFlash(req, type, message) {
+    req.session.flash = { type, message };
+}
+
+function pullFlash(req) {
+    const flash = req.session.flash || null;
+    delete req.session.flash;
+    return flash;
+}
+
+function verifyCsrf(req, res, next) {
+    const token = req.body && req.body._csrf;
+    if (!token || !req.session.csrfToken || !auth.safeEqual(token, req.session.csrfToken)) {
+        setFlash(req, 'error', 'Your session expired. Refresh and try again.');
+        const dest = req.path.startsWith('/login') || !isAuthed(req) ? '/login' : req.path.startsWith('/security') ? '/security' : '/';
+        return res.status(403).redirect(dest);
+    }
+    next();
+}
+
+function isAuthed(req) {
+    return Boolean(req.session && req.session.user && !req.session.pending2fa);
+}
+
+function requireAuth(req, res, next) {
+    if (req.session && req.session.pending2fa) return res.redirect('/login/otp');
+    if (isAuthed(req)) return next();
+    return res.redirect('/login');
+}
+
+function requireFreshPassword(req, res, next) {
+    if (auth.mustChangePassword()) {
+        setFlash(req, 'warning', 'Set a new password before managing forwards. The .env value is only for first-time setup.');
+        return res.redirect('/security');
+    }
+    next();
+}
+
+function clientIp(req) {
+    return req.ip || req.socket.remoteAddress || '';
+}
+
+function regenerateSession(req, fill) {
+    return new Promise((resolve, reject) => {
+        req.session.regenerate((err) => {
+            if (err) return reject(err);
+            req.session.csrfToken = crypto.randomBytes(32).toString('hex');
+            fill(req.session);
+            resolve();
+        });
+    });
+}
 
 function ePort(port, protocol, method) {
     if (method === 'iptables') return `${port}_${protocol}_ipt`;
     return `${port}_${protocol}`;
 }
+
 function dPort(portProtocol) {
     const parts = portProtocol.split('_');
-    if (parts.length === 2) return [parts[0], parts[1], 'socat'];
     if (parts.length === 3 && parts[2] === 'ipt') return [parts[0], parts[1], 'iptables'];
     return [parts[0], parts[1], 'socat'];
 }
+
 function decodePort(portProtocol, value) {
-    let [port, protocol, method] = dPort(portProtocol);
+    const [port, protocol, method] = dPort(portProtocol);
+    let ip;
+    let toPort;
+    let inIface = '*';
+    let outIface = '';
+    let firewallOn = false;
     if (typeof value === 'string') {
-        let [ip, toPort] = value.split(":");
-        return { port, protocol, ip, toPort, method };
+        [ip, toPort] = value.split(':');
+    } else {
+        ip = value.ip;
+        toPort = value.toPort;
+        inIface = value.inIface || '*';
+        outIface = value.outIface || '';
+        firewallOn = !!value.firewall;
     }
-    let { ip, toPort } = value;
-    return { port, protocol, ip, toPort, method };
+    return { port, protocol, ip, toPort, method, inIface, outIface, firewall: firewallOn };
 }
 
-function startWatcher(protocol, port, ip, toPort) {
-    const _protocol = protocol;
-    protocol = protocol == "tcp" ? "TCP" : "UDP";
-    let socat = spawn('/usr/bin/socat', [
-        `${protocol}-LISTEN:${port},bind=0.0.0.0,reuseaddr,fork`,
-        `${protocol}:${ip}:${toPort},reuseaddr`
-    ]);
-    let pid = socat.pid;
-    killDB[ePort(port, _protocol, 'socat')] = pid;
-    socat.stdout.on('data', (data) => console.log(`stdout ${pid}: ${data}`));
-    socat.stderr.on('data', (data) => console.log(`stderr ${pid}: ${data}`));
-    console.log(`Started socat watcher for ${protocol} port ${port} with pid ${pid}`);
+function storeValue(entry) {
+    return {
+        ip: entry.ip,
+        toPort: entry.toPort,
+        inIface: entry.inIface || '*',
+        outIface: entry.outIface || '',
+        firewall: !!entry.firewall
+    };
 }
+
+function listenAddress(entry) {
+    if (entry.inIface && entry.inIface !== '*') {
+        return ipv4Of(entry.inIface) || SERVER_PUBLIC_IP;
+    }
+    return SERVER_PUBLIC_IP;
+}
+
+function startWatcher(entry) {
+    const protocol = entry.protocol;
+    const socatProto = protocol === 'tcp' ? 'TCP' : 'UDP';
+    let listen = `${socatProto}-LISTEN:${entry.port},reuseaddr,fork`;
+    if (entry.inIface && entry.inIface !== '*') {
+        const bindIp = ipv4Of(entry.inIface) || '0.0.0.0';
+        listen += `,bind=${bindIp},so-bindtodevice=${entry.inIface}`;
+    } else {
+        listen += ',bind=0.0.0.0';
+    }
+    let dest = `${socatProto}:${entry.ip}:${entry.toPort},reuseaddr`;
+    if (entry.outIface) {
+        dest += `,so-bindtodevice=${entry.outIface}`;
+        const outIp = ipv4Of(entry.outIface);
+        if (outIp) dest += `,bind=${outIp}`;
+    }
+    const socat = spawn('/usr/bin/socat', [listen, dest]);
+    killDB[ePort(entry.port, protocol, 'socat')] = socat.pid;
+    socat.stdout.on('data', (data) => console.log(`stdout ${socat.pid}: ${data}`));
+    socat.stderr.on('data', (data) => console.log(`stderr ${socat.pid}: ${data}`));
+    console.log(`Started socat watcher for ${socatProto} port ${entry.port} on ${entry.inIface || '*'} with pid ${socat.pid}`);
+}
+
 function stopWatcher(port, protocol) {
-    let pid = killDB[ePort(port, protocol, 'socat')];
+    const pid = killDB[ePort(port, protocol, 'socat')];
     if (!pid) return;
-    try { process.kill(pid, 'SIGKILL'); } catch (e) { }
+    try { process.kill(pid, 'SIGKILL'); } catch (_) { /* already gone */ }
     delete killDB[ePort(port, protocol, 'socat')];
     console.log(`Stopped socat watcher for ${port} with pid ${pid}`);
 }
-function iptablesAddForward(protocol, fromPort, toIp, toPort) {
-    try {
-        // External clients → PREROUTING
-        execSync(`iptables -t nat -A PREROUTING -p ${protocol} -d ${SERVER_PUBLIC_IP} --dport ${fromPort} -j DNAT --to-destination ${toIp}:${toPort}`);
-        // Local-origin traffic → OUTPUT
-        execSync(`iptables -t nat -A OUTPUT -p ${protocol} -d ${SERVER_PUBLIC_IP} --dport ${fromPort} -j DNAT --to-destination ${toIp}:${toPort}`);
-        console.log(`Added iptables forward ${protocol} ${fromPort} => ${toIp}:${toPort}`);
-    } catch (e) {
-        console.error(e.stdout?.toString() || e.message);
-        throw new Error("iptables add failed");
+
+function enableIpForward() {
+    try { fs.writeFileSync('/proc/sys/net/ipv4/ip_forward', '1'); } catch (err) {
+        console.error(`Could not enable ip_forward: ${err.message}`);
     }
 }
 
-function iptablesRemoveForward(protocol, fromPort, toIp, toPort) {
-    try {
-        execSync(`iptables -t nat -D PREROUTING -p ${protocol} -d ${SERVER_PUBLIC_IP} --dport ${fromPort} -j DNAT --to-destination ${toIp}:${toPort}`);
-        execSync(`iptables -t nat -D OUTPUT -p ${protocol} -d ${SERVER_PUBLIC_IP} --dport ${fromPort} -j DNAT --to-destination ${toIp}:${toPort}`);
-        console.log(`Removed iptables forward ${protocol} ${fromPort} => ${toIp}:${toPort}`);
-    } catch (e) {
-        console.error(e.stdout?.toString() || e.message);
+function natCommands(action, entry) {
+    const dest = `${entry.ip}:${entry.toPort}`;
+    const pre = ['-t', 'nat', action, 'PREROUTING', '-p', entry.protocol];
+    if (entry.inIface && entry.inIface !== '*') pre.push('-i', entry.inIface);
+    else pre.push('-d', SERVER_PUBLIC_IP);
+    pre.push('--dport', String(entry.port), '-j', 'DNAT', '--to-destination', dest);
+
+    const commands = [
+        pre,
+        [
+            '-t', 'nat', action, 'OUTPUT', '-p', entry.protocol, '-d', SERVER_PUBLIC_IP,
+            '--dport', String(entry.port), '-j', 'DNAT', '--to-destination', dest
+        ]
+    ];
+    if (entry.outIface) {
+        commands.push([
+            '-t', 'nat', action, 'POSTROUTING', '-o', entry.outIface, '-p', entry.protocol,
+            '-d', entry.ip, '--dport', String(entry.toPort), '-j', 'MASQUERADE'
+        ]);
+    }
+    return commands;
+}
+
+function iptablesNat(action, entry) {
+    for (const args of natCommands(action, entry)) {
+        execFileSync('iptables', args, { timeout: 5000 });
     }
 }
 
+function iptablesAddForward(entry) {
+    try {
+        enableIpForward();
+        iptablesNat('-A', entry);
+        console.log(`Added iptables forward ${entry.protocol} ${entry.port} => ${entry.ip}:${entry.toPort} in=${entry.inIface} out=${entry.outIface || 'auto'}`);
+    } catch (e) {
+        console.error(e.stderr?.toString() || e.message);
+        throw new Error('iptables add failed');
+    }
+}
+
+function iptablesRemoveForward(entry) {
+    try {
+        iptablesNat('-D', entry);
+        console.log(`Removed iptables forward ${entry.protocol} ${entry.port} => ${entry.ip}:${entry.toPort}`);
+    } catch (e) {
+        console.error(e.stderr?.toString() || e.message);
+    }
+}
+
+function listEntries() {
+    const entries = [];
+    for (const key of Object.keys(portDB)) {
+        const entry = decodePort(key, portDB[key]);
+        entry.listenIp = listenAddress(entry);
+        entries.push(entry);
+    }
+    entries.sort((a, b) => Number(a.port) - Number(b.port) || a.protocol.localeCompare(b.protocol) || a.method.localeCompare(b.method));
+    return entries;
+}
+
+function applyForward(entry) {
+    if (entry.method === 'iptables') iptablesAddForward(entry);
+    else startWatcher(entry);
+    if (entry.firewall) {
+        const fw = firewall.open(entry);
+        if (fw && fw.ufwError) {
+            console.error(`Forward added but UFW did not open the port: ${fw.ufwError}`);
+        }
+    }
+}
+
+function withdrawForward(entry) {
+    if (entry.firewall) {
+        try { firewall.close(entry); } catch (err) { console.error(err); }
+    }
+    if (entry.method === 'iptables') iptablesRemoveForward(entry);
+    else stopWatcher(entry.port, entry.protocol);
+}
+
+function stopAllForwards() {
+    for (const key of Object.keys(portDB)) {
+        withdrawForward(decodePort(key, portDB[key]));
+    }
+    try { firewall.flush(); } catch (err) { console.error(err); }
+}
+
+function startAllForwards() {
+    firewall.ensure();
+    for (const key of Object.keys(portDB)) {
+        applyForward(decodePort(key, portDB[key]));
+    }
+}
 
 function syncPortDB() {
-    if (!fs.existsSync('./ports.json')) {
-        fs.writeFileSync('./ports.json', '{}');
+    if (!fs.existsSync(PORTS_FILE)) {
+        fs.writeFileSync(PORTS_FILE, '{}\n');
     }
-    portDB = JSON.parse(fs.readFileSync('./ports.json'));
-    for (const port in portDB) {
-        const { port: p, protocol, ip, toPort, method } = decodePort(port, portDB[port]);
-        if (method === 'iptables') {
-            iptablesRemoveForward(protocol, p, ip, toPort);
-        } else {
-            stopWatcher(p, protocol);
-        }
-    }
-    for (const port in portDB) {
-        const { port: p, protocol, ip, toPort, method } = decodePort(port, portDB[port]);
-        if (method === 'iptables') {
-            iptablesAddForward(protocol, p, ip, toPort);
-        } else {
-            startWatcher(protocol, p, ip, toPort);
-        }
-    }
-}
-function savePortDB() {
-    fs.writeFileSync('./ports.json', JSON.stringify(portDB, null, 4));
+    portDB = JSON.parse(fs.readFileSync(PORTS_FILE, 'utf8'));
+    stopAllForwards();
+    startAllForwards();
 }
 
-// Sync on start
+function savePortDB() {
+    fs.writeFileSync(PORTS_FILE, `${JSON.stringify(portDB, null, 4)}\n`);
+}
+
 syncPortDB();
 
-app.get('/', (req, res) => {
-    let entries = [];
-    for (let key in portDB) {
-        let { port, protocol, ip, toPort, method } = decodePort(key, portDB[key]);
-        entries.push({ port, protocol, ip, toPort, method });
-    }
-    res.render('index', { entries });
+app.get('/login', (req, res) => {
+    if (isAuthed(req)) return res.redirect('/');
+    if (req.session.pending2fa) return res.redirect('/login/otp');
+    res.render('login', { title: 'Sign in' });
 });
 
-app.post('/add', (req, res) => {
-    let { ip, port, toPort, protocol, method } = req.body;
-    protocol = protocol.toLowerCase();
-    method = method || "socat";
-    if (!['tcp', 'udp'].includes(protocol)) return res.send('Invalid protocol');
-    if (!ip.match(/^[0-9.]+$/)) return res.send('Invalid IP');
-    if (!port.match(/^[0-9]+$/)) return res.send('Invalid port');
-    if (!toPort.match(/^[0-9]+$/)) return res.send('Invalid toPort');
-    const key = ePort(port, protocol, method);
-    if (portDB[key]) return res.send('Port already forwarded');
-    if (method === "socat") {
-        startWatcher(protocol, port, ip, toPort);
-    } else if (method === "iptables") {
-        try {
-            iptablesRemoveForward(protocol, port, ip, toPort);
-            iptablesAddForward(protocol, port, ip, toPort);
-        } catch (e) {
-            return res.send("iptables add failed: " + e.message);
+app.post('/login', loginLimiter, verifyCsrf, async (req, res) => {
+    try {
+        if (auth.isLocked()) {
+            const mins = Math.max(1, Math.ceil(auth.lockRemainingMs() / 60000));
+            setFlash(req, 'error', `Too many failed attempts. Try again in ${mins} minute${mins === 1 ? '' : 's'}.`);
+            return res.redirect('/login');
         }
+        const username = String(req.body.username || '');
+        const password = String(req.body.password || '');
+        const ok = await auth.verifyPassword(username, password);
+        if (!ok) {
+            const fail = auth.recordFailure();
+            if (fail.locked) {
+                setFlash(req, 'error', 'Too many failed attempts. Try again in 15 minutes.');
+            } else {
+                setFlash(req, 'error', 'Invalid username or password.');
+            }
+            return res.redirect('/login');
+        }
+        if (auth.isTotpEnabled()) {
+            await regenerateSession(req, (s) => {
+                s.pending2fa = true;
+                s.pendingUser = auth.getPublic().username;
+                s.otpAttempts = 0;
+            });
+            return res.redirect('/login/otp');
+        }
+        auth.recordSuccess(clientIp(req));
+        await regenerateSession(req, (s) => {
+            s.user = auth.getPublic().username;
+        });
+        return res.redirect(auth.mustChangePassword() ? '/security' : '/');
+    } catch (err) {
+        console.error(err);
+        setFlash(req, 'error', 'Could not sign in. Try again.');
+        return res.redirect('/login');
     }
-    portDB[key] = `${ip}:${toPort}`;
+});
+
+app.get('/login/otp', (req, res) => {
+    if (isAuthed(req)) return res.redirect('/');
+    if (!req.session.pending2fa) return res.redirect('/login');
+    res.render('otp', { title: 'Authenticator code' });
+});
+
+app.post('/login/otp', loginLimiter, verifyCsrf, async (req, res) => {
+    try {
+        if (!req.session.pending2fa) return res.redirect('/login');
+        if (auth.isLocked()) {
+            req.session.destroy(() => {});
+            setFlash(req, 'error', 'Too many failed attempts. Try again in 15 minutes.');
+            return res.redirect('/login');
+        }
+        const token = String(req.body.otp || '');
+        const result = auth.verifyLoginSecondFactor(token);
+        if (!result.ok) {
+            req.session.otpAttempts = (req.session.otpAttempts || 0) + 1;
+            const fail = auth.recordFailure();
+            if (fail.locked || req.session.otpAttempts >= 5) {
+                delete req.session.pending2fa;
+                delete req.session.pendingUser;
+                req.session.otpAttempts = 0;
+                setFlash(req, 'error', 'Too many failed attempts. Sign in again.');
+                return res.redirect('/login');
+            }
+            setFlash(req, 'error', 'That authenticator or backup code is not valid.');
+            return res.redirect('/login/otp');
+        }
+        const username = req.session.pendingUser;
+        auth.recordSuccess(clientIp(req));
+        await regenerateSession(req, (s) => {
+            s.user = username;
+        });
+        if (result.usedBackup) {
+            setFlash(req, 'warning', `Signed in with a backup code. ${auth.getPublic().backupCodesRemaining} remaining.`);
+        }
+        return res.redirect(auth.mustChangePassword() ? '/security' : '/');
+    } catch (err) {
+        console.error(err);
+        setFlash(req, 'error', 'Could not verify the code. Try again.');
+        return res.redirect('/login/otp');
+    }
+});
+
+app.post('/logout', verifyCsrf, (req, res) => {
+    req.session.destroy(() => {
+        res.redirect('/login');
+    });
+});
+
+app.get('/', requireAuth, requireFreshPassword, (req, res) => {
+    res.render('index', {
+        title: 'Forwards',
+        entries: listEntries(),
+        totpEnabled: auth.isTotpEnabled(),
+        ifaces: listInterfaces(),
+        fwStatus: firewall.status()
+    });
+});
+
+app.post('/add', requireAuth, requireFreshPassword, verifyCsrf, (req, res) => {
+    const ip = parseIPv4(req.body.ip);
+    const port = parsePort(req.body.port);
+    const toPort = parsePort(req.body.toPort);
+    const protocol = parseProtocol(req.body.protocol);
+    const method = parseMethod(req.body.method || 'socat');
+    const inIface = parseIface(req.body.inIface, { allowAll: true });
+    const outIface = parseIface(req.body.outIface, { allowEmpty: true });
+    const firewallOn = req.body.firewall === '1' || req.body.firewall === 'on';
+
+    if (!ip) {
+        setFlash(req, 'error', 'Enter a valid IPv4 destination address.');
+        return res.redirect('/');
+    }
+    if (!port || !toPort) {
+        setFlash(req, 'error', 'Ports must be integers from 1 to 65535.');
+        return res.redirect('/');
+    }
+    if (!protocol) {
+        setFlash(req, 'error', 'Choose TCP or UDP.');
+        return res.redirect('/');
+    }
+    if (!method) {
+        setFlash(req, 'error', 'Choose socat or iptables.');
+        return res.redirect('/');
+    }
+    if (inIface === null) {
+        setFlash(req, 'error', 'Choose a valid inbound interface, or All.');
+        return res.redirect('/');
+    }
+    if (outIface === null) {
+        setFlash(req, 'error', 'Choose a valid outbound interface, or Auto.');
+        return res.redirect('/');
+    }
+    if (port === PORT) {
+        setFlash(req, 'error', `Port ${PORT} is used by this panel. Pick a different listen port.`);
+        return res.redirect('/');
+    }
+
+    const key = ePort(port, protocol, method);
+    if (portDB[key]) {
+        setFlash(req, 'error', 'That listen port, protocol, and method is already forwarded.');
+        return res.redirect('/');
+    }
+
+    const entry = { port, protocol, ip, toPort, method, inIface, outIface, firewall: firewallOn };
+
+    try {
+        if (method === 'iptables') {
+            try { iptablesRemoveForward(entry); } catch (_) { /* ignore leftover NAT */ }
+        }
+        applyForward(entry);
+    } catch (e) {
+        try { withdrawForward(entry); } catch (_) { /* ignore rollback */ }
+        setFlash(req, 'error', e.message || 'Could not add the forward.');
+        return res.redirect('/');
+    }
+
+    portDB[key] = storeValue(entry);
     savePortDB();
+    const inLabel = inIface === '*' ? 'all NICs' : inIface;
+    const outLabel = outIface || 'auto';
+    const fwLabel = firewallOn ? 'firewall open' : 'firewall unchanged';
+    setFlash(req, 'success', `Forwarding ${listenAddress(entry)}:${port}/${protocol} → ${ip}:${toPort} (${method}, in ${inLabel}, out ${outLabel}, ${fwLabel}).`);
     res.redirect('/');
 });
 
-app.post('/remove', (req, res) => {
-    let { port, protocol, method } = req.body;
-    protocol = protocol.toLowerCase();
-    method = method || "socat";
-    const key = ePort(port, protocol, method);
-    let entry = portDB[key];
-    if (!entry) return res.send('Port not forwarded');
-    let { ip, toPort } = decodePort(key, entry);
-    if (method === "socat") {
-        stopWatcher(port, protocol);
-    } else if (method === "iptables") {
-        iptablesRemoveForward(protocol, port, ip, toPort);
+app.post('/remove', requireAuth, requireFreshPassword, verifyCsrf, (req, res) => {
+    const port = parsePort(req.body.port);
+    const protocol = parseProtocol(req.body.protocol);
+    const method = parseMethod(req.body.method || 'socat');
+    if (!port || !protocol || !method) {
+        setFlash(req, 'error', 'Invalid forward.');
+        return res.redirect('/');
     }
+    const key = ePort(port, protocol, method);
+    const stored = portDB[key];
+    if (!stored) {
+        setFlash(req, 'error', 'That forward is not in the list.');
+        return res.redirect('/');
+    }
+    const entry = decodePort(key, stored);
+    withdrawForward(entry);
     delete portDB[key];
     savePortDB();
+    setFlash(req, 'success', `Removed ${port}/${protocol} (${method}).`);
     res.redirect('/');
 });
 
-app.listen(PORT, () => {
-    console.log(`Web FW listening at port ${PORT}`);
+app.get('/security', requireAuth, async (req, res) => {
+    let totpSetup = null;
+    const pending = auth.getPendingSetup();
+    if (pending) {
+        totpSetup = {
+            secret: pending.secret,
+            qr: await auth.qrDataUrl(pending.otpauth)
+        };
+    }
+    res.render('security', {
+        title: 'Security',
+        totpSetup,
+        mustChangePassword: auth.mustChangePassword()
+    });
 });
+
+app.post('/security/username', requireAuth, verifyCsrf, async (req, res) => {
+    const nextUsername = parseUsername(req.body.username);
+    if (!nextUsername) {
+        setFlash(req, 'error', 'Username must be 3–32 characters: letters, numbers, dot, underscore, or hyphen.');
+        return res.redirect('/security');
+    }
+    const result = await auth.changeUsername(req.body.currentPassword, nextUsername);
+    if (!result.ok) {
+        setFlash(req, 'error', result.error);
+        return res.redirect('/security');
+    }
+    req.session.user = nextUsername;
+    setFlash(req, 'success', 'Username updated.');
+    res.redirect('/security');
+});
+
+app.post('/security/password', requireAuth, verifyCsrf, async (req, res) => {
+    const next = String(req.body.newPassword || '');
+    const confirm = String(req.body.confirmPassword || '');
+    if (next !== confirm) {
+        setFlash(req, 'error', 'New password and confirmation do not match.');
+        return res.redirect('/security');
+    }
+    const problem = validateNewPassword(next, req.session.user);
+    if (problem) {
+        setFlash(req, 'error', problem);
+        return res.redirect('/security');
+    }
+    const result = await auth.changePassword(req.body.currentPassword, next);
+    if (!result.ok) {
+        setFlash(req, 'error', result.error);
+        return res.redirect('/security');
+    }
+    setFlash(req, 'success', 'Password updated. Use it the next time you sign in.');
+    res.redirect('/security');
+});
+
+app.post('/security/totp/start', requireAuth, verifyCsrf, (req, res) => {
+    if (auth.isTotpEnabled()) {
+        setFlash(req, 'error', 'Authenticator is already enabled.');
+        return res.redirect('/security');
+    }
+    auth.beginTotpSetup();
+    res.redirect('/security');
+});
+
+app.post('/security/totp/cancel', requireAuth, verifyCsrf, (req, res) => {
+    auth.cancelTotpSetup();
+    setFlash(req, 'info', 'Authenticator setup cancelled.');
+    res.redirect('/security');
+});
+
+app.post('/security/totp/enable', requireAuth, verifyCsrf, async (req, res) => {
+    const result = auth.confirmTotp(req.body.otp);
+    if (!result.ok) {
+        setFlash(req, 'error', result.error);
+        return res.redirect('/security');
+    }
+    req.session.freshBackupCodes = result.backupCodes;
+    setFlash(req, 'success', 'Authenticator app enabled. Save the backup codes before leaving this page.');
+    res.redirect('/security');
+});
+
+app.post('/security/totp/disable', requireAuth, verifyCsrf, async (req, res) => {
+    const result = await auth.disableTotp(req.body.currentPassword, req.body.otp);
+    if (!result.ok) {
+        setFlash(req, 'error', result.error);
+        return res.redirect('/security');
+    }
+    delete req.session.freshBackupCodes;
+    setFlash(req, 'success', 'Authenticator app disabled.');
+    res.redirect('/security');
+});
+
+app.post('/security/backup-codes', requireAuth, verifyCsrf, async (req, res) => {
+    const result = await auth.regenerateBackupCodes(req.body.currentPassword, req.body.otp);
+    if (!result.ok) {
+        setFlash(req, 'error', result.error);
+        return res.redirect('/security');
+    }
+    req.session.freshBackupCodes = result.backupCodes;
+    setFlash(req, 'warning', 'Previous backup codes no longer work. Save the new set.');
+    res.redirect('/security');
+});
+
+app.post('/security/backup-codes/ack', requireAuth, verifyCsrf, (req, res) => {
+    delete req.session.freshBackupCodes;
+    res.redirect('/security');
+});
+
+app.use((req, res) => {
+    if (req.path === '/favicon.ico' || !req.accepts('html')) {
+        return res.status(404).end();
+    }
+    if (req.path.startsWith('/login') || !isAuthed(req)) {
+        return res.status(404).redirect('/login');
+    }
+    setFlash(req, 'error', 'Page not found.');
+    res.redirect('/');
+});
+
+app.use((err, req, res, _next) => {
+    console.error(err);
+    if (req.session) setFlash(req, 'error', 'Something went wrong.');
+    res.redirect(isAuthed(req) ? '/' : '/login');
+});
+
+const server = app.listen(Number(PORT), BIND_HOST, () => {
+    console.log(`Port Forward panel listening on ${BIND_HOST}:${PORT}`);
+});
+
+server.on('error', (err) => {
+    console.error(`Cannot listen on ${BIND_HOST}:${PORT}: ${err.message}`);
+    process.exit(1);
+});
+
+let shuttingDown = false;
+function shutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`Received ${signal}, stopping forwards`);
+    try { stopAllForwards(); } catch (err) { console.error(err); }
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 8000).unref();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

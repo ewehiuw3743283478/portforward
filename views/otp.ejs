@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <%- include('partials/head') %>
+</head>
+<body>
+<div class="auth-shell">
+    <div class="auth-card">
+        <%- include('partials/brand') %>
+        <h1>Authenticator</h1>
+        <p class="lede">Enter the 6-digit code from your authenticator app, or one of your backup codes.</p>
+        <%- include('partials/flash') %>
+        <form action="/login/otp" method="POST" class="stack">
+            <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+            <label class="field">
+                Code
+                <input id="otp" class="otp-input" name="otp" inputmode="text" autocomplete="one-time-code" required autofocus maxlength="29" placeholder="123456" data-autosubmit="true">
+            </label>
+            <button class="btn btn-primary btn-block" type="submit">Verify</button>
+        </form>
+        <p class="lede tight">Backup codes look like <span class="mono">A1B2C-D3E4F</span>.</p>
+    </div>
+</div>
+<script src="/js/app.js"></script>
+</body>
+</html>

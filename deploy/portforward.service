@@ -1,0 +1,31 @@
+# WorkingDirectory and ExecStart are rewritten by scripts/install-service.sh
+# to match the checkout and the node binary on this host.
+
+[Unit]
+Description=Port Forward web manager
+Documentation=https://github.com/ewehiuw3743283478/portforward
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/portforward
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node /opt/portforward/app.js
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+KillMode=control-group
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=portforward
+LimitNOFILE=65535
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
