@@ -244,6 +244,7 @@ Keep copies of:
 | Symptom | What to check |
 | --- | --- |
 | `systemctl start` fails | `journalctl -u portforward -n 50 --no-pager` — usually missing `.env` keys or a bad `SERVER_PUBLIC_IP` |
+| `Failed with result 'exit-code'` / `spawnargs` / socat | `socat` missing or not executable. `apt-get install -y socat` (or `dnf install socat`), then `systemctl reset-failed portforward && systemctl start portforward`. A bad saved forward no longer takes the whole panel down. |
 | `Cannot listen on … EADDRINUSE` | Another process (or an old `node app.js`) owns `PORT` |
 | Login loops / cookie missing | HTTPS without `COOKIE_SECURE` and `TRUST_PROXY`, or a proxy stripping cookies |
 | iptables forward does not connect | Destination must route replies through this server |

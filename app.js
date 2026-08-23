@@ -262,7 +262,34 @@ function listenAddress(entry) {
     return SERVER_PUBLIC_IP;
 }
 
+function resolveSocat() {
+    const candidates = ['/usr/bin/socat', '/bin/socat', '/usr/local/bin/socat'];
+    for (const candidate of candidates) {
+        try {
+            fs.accessSync(candidate, fs.constants.X_OK);
+            return candidate;
+        } catch (_) { /* try next */ }
+    }
+    try {
+        const found = execFileSync('sh', ['-c', 'command -v socat'], {
+            encoding: 'utf8',
+            timeout: 3000,
+            stdio: ['ignore', 'pipe', 'pipe']
+        }).trim();
+        return found || null;
+    } catch (_) {
+        return null;
+    }
+}
+
+const SOCAT_BIN = resolveSocat();
+if (SOCAT_BIN) console.log(`Using socat at ${SOCAT_BIN}`);
+else console.warn('socat not found on PATH; socat forwards will fail until it is installed');
+
 function startWatcher(entry) {
+    if (!SOCAT_BIN) {
+        throw new Error('socat is not installed. Install the socat package, or use the iptables method.');
+    }
     const protocol = entry.protocol;
     const socatProto = protocol === 'tcp' ? 'TCP' : 'UDP';
     let listen = `${socatProto}-LISTEN:${entry.port},reuseaddr,fork`;
@@ -278,10 +305,19 @@ function startWatcher(entry) {
         const outIp = ipv4Of(entry.outIface);
         if (outIp) dest += `,bind=${outIp}`;
     }
-    const socat = spawn('/usr/bin/socat', [listen, dest]);
-    killDB[ePort(entry.port, protocol, 'socat')] = socat.pid;
-    socat.stdout.on('data', (data) => console.log(`stdout ${socat.pid}: ${data}`));
-    socat.stderr.on('data', (data) => console.log(`stderr ${socat.pid}: ${data}`));
+    const key = ePort(entry.port, protocol, 'socat');
+    const socat = spawn(SOCAT_BIN, [listen, dest], { stdio: ['ignore', 'pipe', 'pipe'] });
+    socat.on('error', (err) => {
+        console.error(`socat error for ${entry.port}/${protocol}: ${err.code || ''} ${err.message}`);
+        delete killDB[key];
+    });
+    if (socat.pid) killDB[key] = socat.pid;
+    if (socat.stdout) socat.stdout.on('data', (data) => console.log(`stdout ${socat.pid}: ${data}`));
+    if (socat.stderr) socat.stderr.on('data', (data) => console.log(`stderr ${socat.pid}: ${data}`));
+    socat.on('exit', (code, signal) => {
+        if (killDB[key] === socat.pid) delete killDB[key];
+        if (code) console.error(`socat for ${entry.port}/${protocol} exited ${code}${signal ? `/${signal}` : ''}`);
+    });
     console.log(`Started socat watcher for ${socatProto} port ${entry.port} on ${entry.inIface || '*'} with pid ${socat.pid}`);
 }
 
@@ -380,15 +416,27 @@ function withdrawForward(entry) {
 
 function stopAllForwards() {
     for (const key of Object.keys(portDB)) {
-        withdrawForward(decodePort(key, portDB[key]));
+        try {
+            withdrawForward(decodePort(key, portDB[key]));
+        } catch (err) {
+            console.error(`Could not stop ${key}: ${err.message || err}`);
+        }
     }
     try { firewall.flush(); } catch (err) { console.error(err); }
 }
 
 function startAllForwards() {
-    firewall.ensure();
+    try {
+        firewall.ensure();
+    } catch (err) {
+        console.error(`Firewall setup failed: ${err.message || err}`);
+    }
     for (const key of Object.keys(portDB)) {
-        applyForward(decodePort(key, portDB[key]));
+        try {
+            applyForward(decodePort(key, portDB[key]));
+        } catch (err) {
+            console.error(`Could not restore ${key}: ${err.message || err}`);
+        }
     }
 }
 
@@ -396,9 +444,15 @@ function syncPortDB() {
     if (!fs.existsSync(PORTS_FILE)) {
         fs.writeFileSync(PORTS_FILE, '{}\n');
     }
-    portDB = JSON.parse(fs.readFileSync(PORTS_FILE, 'utf8'));
-    stopAllForwards();
-    startAllForwards();
+    try {
+        portDB = JSON.parse(fs.readFileSync(PORTS_FILE, 'utf8'));
+    } catch (err) {
+        console.error(`Could not read ports.json: ${err.message}`);
+        portDB = {};
+        return;
+    }
+    try { stopAllForwards(); } catch (err) { console.error(err); }
+    try { startAllForwards(); } catch (err) { console.error(err); }
 }
 
 function savePortDB() {
