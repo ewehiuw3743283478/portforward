@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <%- include('partials/head') %>
+</head>
+<body class="app-shell">
+<%- include('partials/nav') %>
+<main id="main" class="page">
+    <div class="page-head">
+        <div>
+            <h1>Update</h1>
+            <p>Pull the latest panel from GitHub, refresh dependencies, and restart the service. Forwards in <span class="mono">ports.json</span> are kept.</p>
+        </div>
+        <span class="chip mono">v<%= update.version %></span>
+    </div>
+
+    <%- include('partials/flash') %>
+
+    <section class="card">
+        <h2>This install</h2>
+        <% if (!update.git) { %>
+            <p class="card-help">This directory is not a git checkout, so the panel cannot pull updates. Clone the repo and install from there:</p>
+            <pre class="secret-box">git clone https://github.com/ewehiuw3743283478/portforward.git /opt/portforward</pre>
+        <% } else { %>
+            <p class="card-help">Compare the running commit with <span class="mono">origin</span>. Checking uses <span class="mono">git fetch</span>; applying runs <span class="mono">scripts/update.sh</span> and restarts the service.</p>
+            <table>
+                <tbody>
+                    <tr><th>Version</th><td class="mono"><%= update.version %></td></tr>
+                    <tr><th>Branch</th><td class="mono"><%= update.branch || '—' %></td></tr>
+                    <tr><th>Running</th><td class="mono"><%= update.commitShort || '—' %></td></tr>
+                    <tr><th>Origin</th><td class="mono"><%= update.latestShort || 'fetch to see' %></td></tr>
+                    <tr><th>Remote</th><td class="mono"><%= update.remote || '—' %></td></tr>
+                    <tr>
+                        <th>Status</th>
+                        <td>
+                            <% if (update.behind == null) { %>
+                                <span class="muted">Check GitHub to see if a newer commit exists.</span>
+                            <% } else if (update.behind === 0) { %>
+                                <span class="badge badge-fw-on">up to date</span>
+                            <% } else { %>
+                                <span class="badge badge-iptables"><%= update.behind %> commit<%= update.behind === 1 ? '' : 's' %> behind</span>
+                            <% } %>
+                            <% if (update.dirty) { %>
+                                <div class="muted">Local file changes besides ports.json may block git pull.</div>
+                            <% } %>
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        <% } %>
+    </section>
+
+    <% if (update.git) { %>
+    <div class="grid-2">
+        <section class="card">
+            <h2>Check GitHub</h2>
+            <p class="card-help">Fetches origin without changing files or restarting.</p>
+            <form action="/update/check" method="POST">
+                <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+                <button class="btn" type="submit">Check for updates</button>
+            </form>
+        </section>
+        <section class="card">
+            <h2>Apply update</h2>
+            <p class="card-help">Pulls, runs <span class="mono">npm install</span>, refreshes the systemd unit, then restarts. Confirm with your panel password. Refresh this page after a few seconds.</p>
+            <form action="/update/apply" method="POST" class="stack">
+                <input type="hidden" name="_csrf" value="<%= csrfToken %>">
+                <label class="field">
+                    Current password
+                    <input type="password" name="currentPassword" required autocomplete="current-password">
+                </label>
+                <div class="actions-bar">
+                    <button class="btn btn-primary" type="submit">Update and restart</button>
+                </div>
+            </form>
+        </section>
+    </div>
+    <% } %>
+
+    <section class="card">
+        <h2>From the shell</h2>
+        <p class="card-help">Same path as the button, without using the UI.</p>
+        <pre class="secret-box">cd /opt/portforward
+sudo ./scripts/update.sh</pre>
+    </section>
+</main>
+<script src="/js/app.js"></script>
+</body>
+</html>

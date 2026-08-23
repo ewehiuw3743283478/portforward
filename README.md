@@ -144,16 +144,18 @@ sudo journalctl -u portforward -n 100 --no-pager
 
 `stop` is a real stop: the process handles `SIGTERM`, kills socat children, and deletes its iptables DNAT rules. `start` reapplies whatever is in `ports.json`.
 
-### Upgrade
+### Update
+
+From the panel: **Update** in the nav → **Check for updates** or **Update and restart** (confirms with your password). The service restarts; refresh after a few seconds. `ports.json`, `.env`, and `data/` are kept.
+
+From the shell:
 
 ```bash
 cd /opt/portforward
-sudo git pull
-sudo npm install --omit=dev
-sudo systemctl restart portforward
+sudo ./scripts/update.sh
 ```
 
-If `install-service.sh` already ran, you do not need to run it again unless the unit template in `deploy/portforward.service` changed.
+`--no-restart` pulls and installs but leaves the process running. You need a git clone with `origin` set (the installer layout).
 
 ### Uninstall the service
 
@@ -229,6 +231,7 @@ Keep copies of:
 | `data/auth.json` | Hashed login / TOTP (created at runtime) |
 | `deploy/portforward.service` | systemd unit template |
 | `scripts/install-service.sh` | Install / enable / start |
+| `scripts/update.sh` | `git pull`, `npm install`, refresh unit, restart |
 | `scripts/uninstall-service.sh` | Stop and remove the unit |
 | `deploy/nginx.example.conf` | TLS reverse-proxy example |
 

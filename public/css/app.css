@@ -432,6 +432,15 @@ th {
     font-weight: 700;
 }
 
+tbody th {
+    width: 7.5rem;
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 0.82rem;
+    font-weight: 650;
+    color: var(--muted);
+}
+
 tbody tr:hover td { background: rgba(255,255,255,0.02); }
 
 .listen-cell {

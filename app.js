@@ -13,6 +13,7 @@ const { spawn, execFileSync } = require('child_process');
 
 const auth = require('./lib/auth');
 const firewall = require('./lib/firewall');
+const updater = require('./lib/update');
 const { listInterfaces, ipv4Of, parseIface } = require('./lib/net');
 const {
     parseIPv4,
@@ -176,7 +177,13 @@ function verifyCsrf(req, res, next) {
     const token = req.body && req.body._csrf;
     if (!token || !req.session.csrfToken || !auth.safeEqual(token, req.session.csrfToken)) {
         setFlash(req, 'error', 'Your session expired. Refresh and try again.');
-        const dest = req.path.startsWith('/login') || !isAuthed(req) ? '/login' : req.path.startsWith('/security') ? '/security' : '/';
+        const dest = req.path.startsWith('/login') || !isAuthed(req)
+            ? '/login'
+            : req.path.startsWith('/security')
+                ? '/security'
+                : req.path.startsWith('/update')
+                    ? '/update'
+                    : '/';
         return res.status(403).redirect(dest);
     }
     next();
@@ -760,6 +767,42 @@ app.post('/security/backup-codes', requireAuth, verifyCsrf, async (req, res) => 
 app.post('/security/backup-codes/ack', requireAuth, verifyCsrf, (req, res) => {
     delete req.session.freshBackupCodes;
     res.redirect('/security');
+});
+
+app.get('/update', requireAuth, requireFreshPassword, (req, res) => {
+    res.render('update', {
+        title: 'Update',
+        update: updater.status()
+    });
+});
+
+app.post('/update/check', requireAuth, requireFreshPassword, verifyCsrf, (req, res) => {
+    const result = updater.fetchRemote();
+    if (!result.ok) {
+        setFlash(req, 'error', result.error);
+        return res.redirect('/update');
+    }
+    const behind = result.status.behind;
+    if (behind === 0) setFlash(req, 'success', 'Already on the latest commit from origin.');
+    else if (behind > 0) setFlash(req, 'info', `${behind} new commit${behind === 1 ? '' : 's'} on origin. Apply the update when you are ready.`);
+    else setFlash(req, 'info', 'Fetched origin. Compare the commits below.');
+    res.redirect('/update');
+});
+
+app.post('/update/apply', requireAuth, requireFreshPassword, verifyCsrf, async (req, res) => {
+    const username = auth.getPublic().username;
+    const ok = await auth.verifyPassword(username, req.body.currentPassword);
+    if (!ok) {
+        setFlash(req, 'error', 'Current password is incorrect.');
+        return res.redirect('/update');
+    }
+    try {
+        updater.startApply();
+        setFlash(req, 'warning', 'Update started. The panel will restart; refresh this page in a few seconds.');
+    } catch (err) {
+        setFlash(req, 'error', err.message || 'Could not start the update.');
+    }
+    res.redirect('/update');
 });
 
 app.use((req, res) => {
