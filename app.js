@@ -405,12 +405,23 @@ function listEntries() {
 function applyForward(entry) {
     if (entry.method === 'iptables') iptablesAddForward(entry);
     else startWatcher(entry);
-    if (entry.firewall) {
-        const fw = firewall.open(entry);
-        if (fw && fw.ufwError) {
-            console.error(`Forward added but UFW did not open the port: ${fw.ufwError}`);
-        }
-    }
+    if (!entry.firewall) return { firewall: false };
+    const fw = firewall.open(entry);
+    if (fw.ufwError) console.error(`UFW did not open the port: ${fw.ufwError}`);
+    if (fw.iptablesError) console.error(`iptables hole failed: ${fw.iptablesError}`);
+    return fw;
+}
+
+function firewallSummary(fw) {
+    if (!fw || fw.firewall === false) return 'firewall unchanged';
+    const bits = [];
+    if (fw.iptables) bits.push('iptables');
+    if (fw.ufw && fw.ufwActive) bits.push('UFW');
+    else if (fw.ufw && !fw.ufwActive) bits.push('UFW (inactive, rule saved)');
+    if (fw.ufwError) bits.push(`UFW failed: ${fw.ufwError.split('\n')[0]}`);
+    if (fw.iptablesError) bits.push(`iptables failed: ${fw.iptablesError.split('\n')[0]}`);
+    if (fw.ufwWarning) bits.push(fw.ufwWarning);
+    return bits.length ? bits.join('; ') : 'firewall attempted';
 }
 
 function withdrawForward(entry) {
@@ -620,12 +631,13 @@ app.post('/add', requireAuth, requireFreshPassword, verifyCsrf, (req, res) => {
     }
 
     const entry = { port, protocol, ip, toPort, method, inIface, outIface, firewall: firewallOn };
+    let fwResult = { firewall: false };
 
     try {
         if (method === 'iptables') {
             try { iptablesRemoveForward(entry); } catch (_) { /* ignore leftover NAT */ }
         }
-        applyForward(entry);
+        fwResult = applyForward(entry);
     } catch (e) {
         try { withdrawForward(entry); } catch (_) { /* ignore rollback */ }
         setFlash(req, 'error', e.message || 'Could not add the forward.');
@@ -636,8 +648,9 @@ app.post('/add', requireAuth, requireFreshPassword, verifyCsrf, (req, res) => {
     savePortDB();
     const inLabel = inIface === '*' ? 'all NICs' : inIface;
     const outLabel = outIface || 'auto';
-    const fwLabel = firewallOn ? 'firewall open' : 'firewall unchanged';
-    setFlash(req, 'success', `Forwarding ${listenAddress(entry)}:${port}/${protocol} → ${ip}:${toPort} (${method}, in ${inLabel}, out ${outLabel}, ${fwLabel}).`);
+    const fwLabel = firewallSummary(fwResult);
+    const flashType = fwResult && (fwResult.ufwError || fwResult.iptablesError || fwResult.ufwWarning) ? 'warning' : 'success';
+    setFlash(req, flashType, `Forwarding ${listenAddress(entry)}:${port}/${protocol} → ${ip}:${toPort} (${method}, in ${inLabel}, out ${outLabel}, ${fwLabel}).`);
     res.redirect('/');
 });
 

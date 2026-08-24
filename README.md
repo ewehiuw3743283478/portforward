@@ -71,6 +71,8 @@ Each forward can pick:
 
 Removing the forward deletes those same rules. `systemctl stop portforward` flushes the `PORTFORWARD` chain. Existing UFW/iptables policy that you created by hand is left alone.
 
+UFW is driven with `/usr/sbin/ufw` and the documented syntax (`allow 8080/tcp` or `allow in on eth0 proto tcp to any port 8080`). If UFW is **inactive**, the rule is still saved (`ufw show added`) but it does not filter until you `ufw enable`. The panel will warn in that case. After each UFW change the `PORTFORWARD` jump is put back, because `ufw` rewrites the filter table.
+
 `FORWARD` is often `DROP` on Docker hosts. Opening the port this way is what actually lets DNAT traffic through.
 
 ## Configuration
